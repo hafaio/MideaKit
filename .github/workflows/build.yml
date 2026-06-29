@@ -17,3 +17,13 @@ jobs:
         run: swift build -Xswiftc -strict-concurrency=complete
       - name: Test
         run: swift test
+      - name: Build documentation
+        # Build the docs on every commit so a doc-comment break can't merge and
+        # only surface later at release time. This compiles them; it doesn't deploy.
+        env:
+          MIDEAKIT_DOCS: "1"
+        run: |
+          swift package --allow-writing-to-directory "$RUNNER_TEMP/docs" \
+            generate-documentation --target MideaKit \
+            --transform-for-static-hosting --hosting-base-path MideaKit \
+            --output-path "$RUNNER_TEMP/docs"
