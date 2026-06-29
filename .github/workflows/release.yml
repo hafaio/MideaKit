@@ -1,0 +1,94 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+jobs:
+  gate:
+    uses: ./.github/workflows/build.yml
+
+  prepare:
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute new version
+        id: bump
+        run: |
+          current=$(git tag --list '[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          current=${current:-0.0.0}
+          IFS='.' read -r major minor patch <<< "$current"
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          version="${major}.${minor}.${patch}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "New version: ${version}"
+
+  release:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag and create release
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${VERSION}" -m "${VERSION}"
+          git push origin "${VERSION}"
+          gh release create "${VERSION}" --generate-notes
+
+  docs:
+    needs: [prepare, release]
+    runs-on: macos-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "${{ needs.prepare.outputs.version }}"
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - name: Build documentation
+        env:
+          MIDEAKIT_DOCS: "1"
+        run: |
+          swift package --allow-writing-to-directory ./docs \
+            generate-documentation --target MideaKit \
+            --transform-for-static-hosting \
+            --hosting-base-path MideaKit \
+            --output-path ./docs
+          echo '<script>location.href = "documentation/mideakit"</script>' > ./docs/index.html
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "./docs"
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
