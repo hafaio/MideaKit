@@ -150,6 +150,10 @@ public struct SetState: Sendable {
     let hasHalf = clamped - Double(integral) > 0
     var temperature: UInt8
     var temperatureAlt: UInt8
+    // The setpoint rides either the main 4-bit field (17–30°C) or an alternate
+    // 5-bit field ((integral − 12) & 0x1F, ~13–43°C) that the parser still reads
+    // back. The clamp above keeps us on the main field today; the alt branch is
+    // kept so encode mirrors the full wire layout and is ready if the range widens.
     if (17...30).contains(integral) {
       temperature = UInt8((integral - 16) & 0xF)
       temperatureAlt = 0
