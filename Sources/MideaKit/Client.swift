@@ -9,6 +9,10 @@ import Network
 /// after a failed call. Drive it from one task at a time — the connection is not
 /// re-entrant, so callers must serialize their own access.
 ///
+/// Version-3 devices use a token/key handshake; version-2 devices use an
+/// unauthenticated `0x5A5A` transport with no handshake. The client selects the
+/// right one from the credentials' `version`.
+///
 /// Construct it from the ``DeviceCredentials`` that ``Setup/run(cloud:)``
 /// returns, then reuse the instance:
 ///
@@ -36,6 +40,7 @@ public final class MideaClient {
   private let host: String
   private let port: UInt16
   private let deviceId: UInt64
+  private let version: Int
   private let token: [UInt8]
   private let key: [UInt8]
 
@@ -57,12 +62,18 @@ public final class MideaClient {
   ///   - host: The device's IP address or hostname.
   ///   - port: The device's control port.
   ///   - deviceId: The device's numeric id.
-  ///   - token: The authentication token bytes.
-  ///   - key: The session key bytes.
-  public init(host: String, port: UInt16, deviceId: UInt64, token: [UInt8], key: [UInt8]) {
+  ///   - version: The device's LAN protocol version (2 or 3). Version 3 performs
+  ///     the token/key handshake; version 2 uses the unauthenticated transport and
+  ///     ignores `token`/`key`.
+  ///   - token: The authentication token bytes (empty for version 2).
+  ///   - key: The session key bytes (empty for version 2).
+  public init(
+    host: String, port: UInt16, deviceId: UInt64, version: Int, token: [UInt8], key: [UInt8]
+  ) {
     self.host = host
     self.port = port
     self.deviceId = deviceId
+    self.version = version
     self.token = token
     self.key = key
   }
@@ -174,11 +185,14 @@ public final class MideaClient {
       return
     }
     disconnect()
-    let connection = MideaConnection(host: host, port: port, deviceId: deviceId)
+    let connection = MideaConnection(host: host, port: port, deviceId: deviceId, version: version)
     do {
       try await connection.connect()
-      try await connection.authenticate(token: token, key: key)
-      await warmUp(connection)
+      if version >= 3 {
+        // V2 has no handshake, so no post-auth warm-up either.
+        try await connection.authenticate(token: token, key: key)
+        await warmUp(connection)
+      }
     } catch {
       connection.disconnect()  // don't leak the half-open socket
       throw error
@@ -217,11 +231,18 @@ public final class MideaClient {
     do {
       return try await operation(connection)
     } catch {
+      // Any failure may have left the stream mid-frame, so drop the connection;
+      // the next call reconnects cleanly. Retry once for transport faults only.
       disconnect()
       guard retry, Self.isRetryable(error) else { throw error }
       try await ensureConnected()
       guard let fresh = self.connection else { throw error }
-      return try await operation(fresh)
+      do {
+        return try await operation(fresh)
+      } catch {
+        disconnect()
+        throw error
+      }
     }
   }
 

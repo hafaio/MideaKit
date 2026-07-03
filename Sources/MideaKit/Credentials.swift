@@ -109,7 +109,7 @@ extension MideaClient {
   public convenience init(credentials: DeviceCredentials) {
     self.init(
       host: credentials.ip, port: credentials.port, deviceId: credentials.id,
-      token: credentials.tokenBytes, key: credentials.keyBytes
+      version: credentials.version, token: credentials.tokenBytes, key: credentials.keyBytes
     )
   }
 }
