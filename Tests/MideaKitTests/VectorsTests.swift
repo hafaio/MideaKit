@@ -3,8 +3,8 @@ import Testing
 
 @testable import MideaKit
 
-/// Cross-validates MideaKit against vectors generated from the canonical Python
-/// reference (msmart). Regenerate vectors.json with tools/generate_vectors.py.
+/// Cross-validates MideaKit against `vectors.json`, captured from the canonical
+/// Python reference (msmart).
 @Suite struct VectorsTests {
   private func vectors() throws -> [String: Any] {
     let url = Bundle.module.url(forResource: "vectors", withExtension: "json")!

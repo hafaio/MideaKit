@@ -45,11 +45,9 @@ public final class MideaClient {
   private let sessionLifetime: TimeInterval = 11 * 3600
 
   // After auth the device needs a beat before it answers queries. Rather than a
-  // flat wait, send one getState and proceed the instant a reply lands; the
-  // ceiling matches the old conservative 1s so a slow unit is no worse off, and a
-  // brief floor avoids querying at the very instant auth completes.
+  // flat wait, send one getState and proceed the instant its reply lands. A brief
+  // floor avoids querying at the very instant auth completes.
   private let warmUpFloor: UInt64 = 200_000_000
-  private let warmUpCeiling: TimeInterval = 1.2
 
   /// Create a client for a device, given the address and keys obtained during
   /// setup. Prefer ``init(credentials:)`` when you have stored
@@ -190,10 +188,12 @@ public final class MideaClient {
   }
 
   /// Wait until the freshly authenticated device will answer queries: send one
-  /// getState and consume its reply, returning the moment it lands (a fast unit
-  /// answers in a fraction of a second), bounded by `warmUpCeiling`. getState is
-  /// idempotent, so the lone probe is harmless; if the device never answers it,
-  /// the bounded read times out and the real call retries anyway.
+  /// getState and consume its reply, returning the moment it lands. getState is
+  /// idempotent, so the lone probe is harmless. The reply is read with the normal
+  /// timeout and fully consumed here — not read with a short ceiling and abandoned
+  /// — so a slow unit's late answer can't linger in the buffer and desync every
+  /// later request from its response. If the device never answers, the read times
+  /// out and the first real call surfaces the failure.
   private func warmUp(_ connection: MideaConnection) async {
     try? await Task.sleep(nanoseconds: warmUpFloor)
     do {
@@ -201,7 +201,7 @@ public final class MideaClient {
     } catch {
       return
     }
-    _ = try? await connection.readApplicationFrame(timeout: warmUpCeiling)
+    _ = try? await connection.readApplicationFrame()
   }
 
   /// Run an operation on the live connection, reconnecting and retrying once if

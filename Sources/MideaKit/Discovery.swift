@@ -141,8 +141,10 @@ public enum Discovery {
     var current = ifaddrPointer
     while let interface = current {
       let flags = Int32(interface.pointee.ifa_flags)
-      let family = interface.pointee.ifa_addr.pointee.sa_family
-      if family == sa_family_t(AF_INET),
+      // ifa_addr can be nil for some interfaces (e.g. certain tunnels), so guard
+      // it rather than force-dereferencing, just as ifa_dstaddr is guarded below.
+      if let address = interface.pointee.ifa_addr,
+        address.pointee.sa_family == sa_family_t(AF_INET),
         flags & IFF_BROADCAST != 0, flags & IFF_UP != 0,
         let broadcast = interface.pointee.ifa_dstaddr
       {
