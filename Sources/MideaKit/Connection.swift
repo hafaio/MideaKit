@@ -27,7 +27,9 @@ private enum ReadOutcome {
   case failure(Error)
 }
 
-/// TCP transport implementing the Midea V3 "8370" framing and key handshake.
+/// TCP transport for the Midea LAN protocol. Version-3 devices use the "8370"
+/// framing with the key handshake; version-2 devices use the unauthenticated
+/// `0x5A5A` framing directly, with no handshake.
 ///
 /// Not thread-safe: drive it from a single task, awaiting each call in turn.
 /// `@unchecked Sendable` because all receive-side mutable state (`buffer`,
@@ -37,6 +39,7 @@ private enum ReadOutcome {
 public final class MideaConnection: @unchecked Sendable {
   private let connection: NWConnection
   private let deviceId: UInt64
+  private let version: Int
   private let queue = DispatchQueue(label: "midea.connection")
 
   private var buffer = [UInt8]()
@@ -62,8 +65,11 @@ public final class MideaConnection: @unchecked Sendable {
   ///   - host: The device's IP address or hostname.
   ///   - port: The device's control port.
   ///   - deviceId: The device's numeric id.
-  public init(host: String, port: UInt16, deviceId: UInt64) {
+  ///   - version: The device's LAN protocol version (2 or 3); selects the framing
+  ///     and whether ``authenticate(token:key:)`` is required.
+  public init(host: String, port: UInt16, deviceId: UInt64, version: Int) {
     self.deviceId = deviceId
+    self.version = version
     self.connection = NWConnection(
       host: NWEndpoint.Host(host),
       port: NWEndpoint.Port(rawValue: port)!,
@@ -132,8 +138,9 @@ public final class MideaConnection: @unchecked Sendable {
   /// - Parameter frame: The application command frame to send.
   /// - Throws: An error if the connection isn't authenticated or the send fails.
   public func sendApplicationFrame(_ frame: [UInt8]) async throws {
-    let v2 = try V2Packet.encode(deviceId: deviceId, command: frame)
-    try await writeRaw(try encodeEncrypted(v2))
+    let packet = try V2Packet.encode(deviceId: deviceId, command: frame)
+    // V3 wraps the 0x5A5A packet in the encrypted 8370 layer; V2 sends it bare.
+    try await writeRaw(version >= 3 ? try encodeEncrypted(packet) : packet)
   }
 
   /// Read one application command frame from the device. Buffered bytes survive a
@@ -145,8 +152,11 @@ public final class MideaConnection: @unchecked Sendable {
   /// - Throws: ``TimeoutError`` if the timeout elapses, or an error if the
   ///   stream ends or a frame can't be decoded.
   public func readApplicationFrame(timeout: TimeInterval = 8) async throws -> [UInt8] {
-    let packet = try await readPacket(timeout: timeout)
-    let inner = try process(packet)
+    // V3 unwraps the 8370 layer around the 0x5A5A packet; V2 reads it bare.
+    let inner =
+      version >= 3
+      ? try process(try await readPacket(timeout: timeout))
+      : try await readV2Packet(timeout: timeout)
     return try V2Packet.decode(inner)
   }
 
@@ -222,18 +232,30 @@ public final class MideaConnection: @unchecked Sendable {
     }
   }
 
-  /// Assemble and return one complete 8370 packet from the receive buffer,
-  /// waiting for more bytes if needed. `timeout` bounds only the wait; on a
+  /// Assemble and return one complete 8370 packet from the receive buffer.
+  private func readPacket(timeout: TimeInterval = 8) async throws -> [UInt8] {
+    try await readFramed(timeout: timeout) { self.extractPacket() }
+  }
+
+  /// Assemble and return one complete bare 0x5A5A packet (V2 transport).
+  private func readV2Packet(timeout: TimeInterval = 8) async throws -> [UInt8] {
+    try await readFramed(timeout: timeout) { self.extractV2Packet() }
+  }
+
+  /// Wait for `extract` to yield one complete packet from the receive buffer,
+  /// pulling more bytes as they arrive. `timeout` bounds only the wait; on a
   /// timeout every received byte stays buffered (the pump never abandons a
   /// receive), so the stream stays in sync and a later read resumes cleanly.
-  private func readPacket(timeout: TimeInterval = 8) async throws -> [UInt8] {
+  private func readFramed(
+    timeout: TimeInterval, _ extract: @escaping @Sendable () -> [UInt8]?
+  ) async throws -> [UInt8] {
     let deadline = DispatchTime.now() + timeout
     while true {
       let outcome: ReadOutcome = await withCheckedContinuation { cont in
         let resumed = ResumeGuard()
         queue.async {
           self.startPump()
-          if let packet = self.extractPacket() {
+          if let packet = extract() {
             if resumed.tryResume() { cont.resume(returning: .packet(packet)) }
           } else if let error = self.terminalError {
             if resumed.tryResume() { cont.resume(returning: .failure(error)) }
@@ -307,7 +329,7 @@ public final class MideaConnection: @unchecked Sendable {
   /// buffered yet. Advances `bufferStart` past consumed bytes. Must be called on
   /// `queue`.
   private func extractPacket() -> [UInt8]? {
-    guard let start = indexOfStart() else { return nil }
+    guard let start = indexOfStart(0x83, 0x70) else { return nil }
     bufferStart = start  // discard any garbage before the start marker
     let available = buffer.count - bufferStart
     guard available >= 6 else { return nil }
@@ -319,13 +341,29 @@ public final class MideaConnection: @unchecked Sendable {
     return packet
   }
 
-  /// Index of the next `0x83 0x70` start marker at or after `bufferStart`, or nil
-  /// if none is buffered yet. Must be called on `queue`.
-  private func indexOfStart() -> Int? {
+  /// Pull one complete bare 0x5A5A packet from `buffer`, or nil if a whole packet
+  /// isn't buffered yet. Its total length lives at bytes 4-5, little-endian.
+  /// Advances `bufferStart` past consumed bytes. Must be called on `queue`.
+  private func extractV2Packet() -> [UInt8]? {
+    guard let start = indexOfStart(0x5A, 0x5A) else { return nil }
+    bufferStart = start  // discard any garbage before the start marker
+    let available = buffer.count - bufferStart
+    guard available >= 6 else { return nil }
+    let total = Int(buffer[bufferStart + 4]) | (Int(buffer[bufferStart + 5]) << 8)
+    guard total >= 6, available >= total else { return nil }
+    let packet = Array(buffer[bufferStart..<(bufferStart + total)])
+    bufferStart += total
+    compactBuffer()
+    return packet
+  }
+
+  /// Index of the next `first second` start marker at or after `bufferStart`, or
+  /// nil if none is buffered yet. Must be called on `queue`.
+  private func indexOfStart(_ first: UInt8, _ second: UInt8) -> Int? {
     guard buffer.count - bufferStart >= 2 else { return nil }
     var index = bufferStart
     while index < buffer.count - 1 {
-      if buffer[index] == 0x83 && buffer[index + 1] == 0x70 { return index }
+      if buffer[index] == first && buffer[index + 1] == second { return index }
       index += 1
     }
     return nil
