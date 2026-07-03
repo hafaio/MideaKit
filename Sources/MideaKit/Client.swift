@@ -54,6 +54,10 @@ public final class MideaClient {
   // floor avoids querying at the very instant auth completes.
   private let warmUpFloor: UInt64 = 200_000_000
 
+  // The module frees its single TCP slot lazily, so reconnecting inside the same
+  // second lands on the still-held slot and squanders the one retry. Wait it out.
+  private let reconnectCooldown: UInt64 = 1_000_000_000
+
   /// Create a client for a device, given the address and keys obtained during
   /// setup. Prefer ``init(credentials:)`` when you have stored
   /// ``DeviceCredentials``.
@@ -220,9 +224,11 @@ public final class MideaClient {
 
   /// Run an operation on the live connection, reconnecting and retrying once if
   /// it fails with a transport error (e.g. the device dropped an idle
-  /// connection). `retry` should be false for non-idempotent commands (e.g. a
-  /// relative toggle) so a lost response doesn't double-apply. Protocol, auth,
-  /// and timeout errors are surfaced immediately rather than retried.
+  /// connection). The retry reconnects after a short cool-down so the device's
+  /// single TCP slot has time to free. `retry` should be false for non-idempotent
+  /// commands (e.g. a relative toggle) so a lost response doesn't double-apply.
+  /// Protocol, auth, and timeout errors are surfaced immediately rather than
+  /// retried.
   private func withConnection<T>(
     retry: Bool = true, _ operation: (MideaConnection) async throws -> T
   ) async throws -> T {
@@ -235,6 +241,7 @@ public final class MideaClient {
       // the next call reconnects cleanly. Retry once for transport faults only.
       disconnect()
       guard retry, Self.isRetryable(error) else { throw error }
+      try? await Task.sleep(nanoseconds: reconnectCooldown)
       try await ensureConnected()
       guard let fresh = self.connection else { throw error }
       do {
