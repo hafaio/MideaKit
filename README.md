@@ -1,6 +1,7 @@
 # MideaKit
 
 [![build](https://github.com/hafaio/MideaKit/actions/workflows/build.yml/badge.svg)](https://github.com/hafaio/MideaKit/actions/workflows/build.yml)
+[![docs](https://img.shields.io/badge/docs-DocC-informational.svg)](https://hafaio.github.io/MideaKit/)
 
 Native Swift library for local control of Midea (and rebranded) WiFi air
 conditioners over the LAN — no cloud after a one-time key fetch.
@@ -102,17 +103,14 @@ normal TCP connection and needs neither.
 
 ### Post-authentication warm-up
 
-A freshly authenticated device drops or ignores queries sent in the first moment
-after the handshake. `MideaClient` sends one throwaway `getState` probe and
-proceeds the instant its reply begins arriving, bounded by a ~1.2s ceiling — a
-fast unit answers in a fraction of a second. `getState` is idempotent, so the
-probe is harmless.
-
-Residual edge: if a device first answers *slower* than the ceiling, its probe
-reply is left unconsumed and a following `toggleDisplay` (the only
-non-idempotent, non-retried call) could misread it. The ceiling is sized so a
-healthy device always replies within it; the protocol has no request/reply
-correlation id to close this fully.
+A freshly authenticated version-3 device drops or ignores queries sent in the
+first moment after the handshake. After a brief (~200 ms) floor, `MideaClient`
+sends one throwaway `getState` probe and proceeds the instant its reply lands.
+The reply is read with the normal timeout and fully consumed, so a slow unit's
+late answer can't linger in the buffer and desync every later request from its
+response. `getState` is idempotent, so the probe is harmless; if the device
+never answers, the read times out and the first real call surfaces the failure.
+Version-2 devices have no handshake, so they skip the warm-up entirely.
 
 ### Concurrency
 
