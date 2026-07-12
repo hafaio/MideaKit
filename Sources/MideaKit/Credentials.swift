@@ -20,6 +20,8 @@ public struct DeviceCredentials: Codable, Sendable {
   public let token: String
   /// The session key, hex-encoded (empty for V2 devices).
   public let key: String
+  /// The device's serial number, from discovery; `nil` if it didn't report one.
+  public let serialNumber: String?
 
   /// The token decoded to raw bytes.
   public var tokenBytes: [UInt8] { Self.hexToBytes(token) }
@@ -36,9 +38,10 @@ public struct DeviceCredentials: Codable, Sendable {
   ///   - version: The LAN protocol version (2 or 3).
   ///   - token: The authentication token, hex-encoded.
   ///   - key: The session key, hex-encoded.
+  ///   - serialNumber: The device's serial number, or `nil` if it didn't report one.
   public init(
     name: String, id: UInt64, ip: String, port: UInt16,
-    version: Int, token: String, key: String
+    version: Int, token: String, key: String, serialNumber: String?
   ) {
     self.name = name
     self.id = id
@@ -47,6 +50,7 @@ public struct DeviceCredentials: Codable, Sendable {
     self.version = version
     self.token = token
     self.key = key
+    self.serialNumber = serialNumber
   }
 
   /// Decode a hex string into bytes, ignoring a trailing odd nibble.

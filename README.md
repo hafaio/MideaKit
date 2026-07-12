@@ -85,7 +85,8 @@ for bigEndian in [false, true] {
 
 let client = MideaClient(credentials: DeviceCredentials(
     name: device.name, id: device.id, ip: device.ip, port: device.port,
-    version: device.version, token: pair!.token, key: pair!.key))
+    version: device.version, token: pair!.token, key: pair!.key,
+    serialNumber: device.serialNumber))
 print(try await client.refresh().targetTemperature)
 ```
 
