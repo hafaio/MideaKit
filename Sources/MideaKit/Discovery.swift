@@ -13,8 +13,8 @@ public struct DiscoveredDevice: Sendable {
   public let version: Int
   /// The device's advertised name.
   public let name: String
-  /// The device's serial number.
-  public let serialNumber: String
+  /// The device's serial number, or `nil` if it didn't report one.
+  public let serialNumber: String?
 }
 
 /// Errors thrown by `Discovery.discover`.
@@ -84,7 +84,7 @@ public enum Discovery {
     return Array(found.values)
   }
 
-  private static func parse(data: [UInt8], ip: String) -> DiscoveredDevice? {
+  static func parse(data: [UInt8], ip: String) -> DiscoveredDevice? {
     guard data.count >= 42 else { return nil }
     let version: Int
     var body = data
@@ -106,16 +106,20 @@ public enum Discovery {
     else { return nil }
 
     let port = UInt16(leInt(decrypted[4..<6]))
-    let serial = String(bytes: decrypted[8..<40], encoding: .ascii) ?? ""
+    // The serial sits in a fixed 32-byte field, NUL- or space-padded on the wire.
+    let serial = String(bytes: decrypted[8..<40], encoding: .ascii)?
+      .trimmingCharacters(in: Self.serialPadding)
     let nameLength = Int(decrypted[40])
     let nameEnd = min(41 + nameLength, decrypted.count)
     let name = String(bytes: decrypted[41..<nameEnd], encoding: .utf8) ?? "air-conditioner"
 
     return DiscoveredDevice(
       id: deviceId, ip: ip, port: port, version: version,
-      name: name, serialNumber: serial
+      name: name, serialNumber: serial.flatMap { $0.isEmpty ? nil : $0 }
     )
   }
+
+  private static let serialPadding = CharacterSet(charactersIn: "\0").union(.whitespaces)
 
   private static func send(_ data: [UInt8], to ip: String, port: UInt16, fd: Int32) {
     var addr = sockaddr_in()

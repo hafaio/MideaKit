@@ -97,7 +97,7 @@ public enum Setup {
       client.disconnect()
       return DeviceCredentials(
         name: device.name, id: device.id, ip: device.ip, port: device.port,
-        version: device.version, token: "", key: "")
+        version: device.version, token: "", key: "", serialNumber: device.serialNumber)
     } catch {
       client.disconnect()
       return nil
@@ -123,7 +123,8 @@ public enum Setup {
         client.disconnect()
         return DeviceCredentials(
           name: device.name, id: device.id, ip: device.ip, port: device.port,
-          version: device.version, token: pair.token, key: pair.key)
+          version: device.version, token: pair.token, key: pair.key,
+          serialNumber: device.serialNumber)
       } catch {
         client.disconnect()
         continue
