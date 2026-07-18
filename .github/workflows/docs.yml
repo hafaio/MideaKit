@@ -1,0 +1,48 @@
+# Build DocC docs from a tag and deploy to Pages; dispatched by cut.yml, re-runnable by hand.
+name: docs
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build docs from (e.g. 0.3.0)"
+        required: true
+        type: string
+
+permissions:
+  pages: write
+  id-token: write
+
+jobs:
+  docs:
+    runs-on: macos-latest
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - name: Build documentation
+        env:
+          MIDEAKIT_DOCS: "1"
+        run: |
+          swift package --allow-writing-to-directory ./docs \
+            generate-documentation --target MideaKit \
+            --transform-for-static-hosting \
+            --hosting-base-path MideaKit \
+            --output-path ./docs
+          echo '<script>location.href = "documentation/mideakit"</script>' > ./docs/index.html
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "./docs"
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
