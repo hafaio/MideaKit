@@ -1,4 +1,4 @@
-import Foundation
+import Synchronization
 
 /// The air conditioner's operating mode.
 public enum OperationalMode: UInt8, CaseIterable, Sendable {
@@ -21,15 +21,11 @@ public enum FanSpeed: UInt8, CaseIterable, Sendable {
 }
 
 /// Global message-id counter, mirroring msmart's incrementing id.
-/// Lock-guarded, so safe to share across tasks.
-private final class MessageId: @unchecked Sendable {
-  static let shared = MessageId()
-  private var value: UInt8 = 0
-  private let lock = NSLock()
-  func next() -> UInt8 {
-    lock.lock()
-    defer { lock.unlock() }
-    value = value &+ 1
+private let messageId = Mutex<UInt8>(0)
+
+private func nextMessageId() -> UInt8 {
+  messageId.withLock { value in
+    value &+= 1
     return value
   }
 }
@@ -37,7 +33,7 @@ private final class MessageId: @unchecked Sendable {
 /// Wrap a command body in message-id + CRC, then the 0xAA frame.
 private func buildCommand(frameType: Frame.FrameType, body: [UInt8]) -> [UInt8] {
   var payload = body
-  payload.append(MessageId.shared.next())
+  payload.append(nextMessageId())
   payload.append(CRC8.calculate(payload))
   return Frame.build(frameType: frameType, body: payload)
 }

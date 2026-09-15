@@ -7,8 +7,8 @@ Native Swift library for local control of Midea (and rebranded) WiFi air
 conditioners over the LAN — no cloud after a one-time key fetch.
 This is a Swift port of [msmart-ng](https://github.com/mill1000/midea-msmart).
 
-Works on macOS and iOS. Pure Swift (Network, CryptoKit, CommonCrypto) with no
-third-party dependencies.
+Works on macOS 26 and iOS 26 or later. Pure Swift (Network, CryptoKit,
+CommonCrypto) with no third-party dependencies.
 
 Calls are `async` — drive one client from a single task at a time (await each
 call before the next); the connection is not re-entrant.
