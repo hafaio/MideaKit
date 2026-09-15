@@ -52,11 +52,11 @@ public final class MideaClient {
   // After auth the device needs a beat before it answers queries. Rather than a
   // flat wait, send one getState and proceed the instant its reply lands. A brief
   // floor avoids querying at the very instant auth completes.
-  private let warmUpFloor: UInt64 = 200_000_000
+  private let warmUpFloor: Duration = .milliseconds(200)
 
   // The module frees its single TCP slot lazily, so reconnecting inside the same
   // second lands on the still-held slot and squanders the one retry. Wait it out.
-  private let reconnectCooldown: UInt64 = 1_000_000_000
+  private let reconnectCooldown: Duration = .seconds(1)
 
   /// Create a client for a device, given the address and keys obtained during
   /// setup. Prefer ``init(credentials:)`` when you have stored
@@ -213,7 +213,7 @@ public final class MideaClient {
   /// later request from its response. If the device never answers, the read times
   /// out and the first real call surfaces the failure.
   private func warmUp(_ connection: MideaConnection) async {
-    try? await Task.sleep(nanoseconds: warmUpFloor)
+    try? await Task.sleep(for: warmUpFloor)
     do {
       try await connection.sendApplicationFrame(Command.getState())
     } catch {
@@ -241,7 +241,7 @@ public final class MideaClient {
       // the next call reconnects cleanly. Retry once for transport faults only.
       disconnect()
       guard retry, Self.isRetryable(error) else { throw error }
-      try? await Task.sleep(nanoseconds: reconnectCooldown)
+      try? await Task.sleep(for: reconnectCooldown)
       try await ensureConnected()
       guard let fresh = self.connection else { throw error }
       do {
