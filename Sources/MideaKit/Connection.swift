@@ -4,27 +4,84 @@ import Network
 /// Thrown when a connect or read does not complete within its timeout.
 public struct TimeoutError: Error {}
 
-/// Single-use guard so a continuation backed by multiple callbacks resumes once.
-/// All access is serialized on the connection's dispatch queue.
-private final class ResumeGuard: @unchecked Sendable {
-  private let lock = NSLock()
-  private var done = false
-  func tryResume() -> Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    if done { return false }
-    done = true
-    return true
-  }
+/// One thing a reader can observe: a complete framed packet, the expiry of a
+/// read's own timer, or the end of the stream.
+private enum Event: Sendable {
+  case packet([UInt8])
+  // The token identifies the read that armed the timer, so a timer that fires
+  // just as its packet lands can't time out a later read.
+  case timeout(UInt64)
+  case ended(any Error)
 }
 
-/// The outcome of one wait inside `readPacket`: a complete packet, a request to
-/// retry after more bytes arrived, a timeout, or a terminal stream error.
-private enum ReadOutcome {
-  case packet([UInt8])
-  case more
-  case timedOut
-  case failure(Error)
+/// The received bytes waiting to be framed, owned exclusively by the receive
+/// pump, so it needs no lock.
+private struct FrameBuffer {
+  private var buffer = [UInt8]()
+  // Index of the first unconsumed byte in `buffer`. Consuming a packet advances
+  // this instead of shifting the array; the prefix is reclaimed in bulk by
+  // `compactBuffer()`, keeping packet assembly O(1) amortized rather than O(n²).
+  private var bufferStart = 0
+
+  mutating func append(_ data: Data) {
+    buffer.append(contentsOf: data)
+  }
+
+  /// Pull one complete 8370 packet from `buffer`, or nil if a whole packet isn't
+  /// buffered yet. Advances `bufferStart` past consumed bytes.
+  mutating func extractPacket() -> [UInt8]? {
+    guard let start = indexOfStart(0x83, 0x70) else { return nil }
+    bufferStart = start  // discard any garbage before the start marker
+    let available = buffer.count - bufferStart
+    guard available >= 6 else { return nil }
+    let total = (Int(buffer[bufferStart + 2]) << 8 | Int(buffer[bufferStart + 3])) + 8
+    guard available >= total else { return nil }
+    let packet = Array(buffer[bufferStart..<(bufferStart + total)])
+    bufferStart += total
+    compactBuffer()
+    return packet
+  }
+
+  /// Pull one complete bare 0x5A5A packet from `buffer`, or nil if a whole packet
+  /// isn't buffered yet. Its total length lives at bytes 4-5, little-endian.
+  /// Advances `bufferStart` past consumed bytes.
+  mutating func extractV2Packet() -> [UInt8]? {
+    guard let start = indexOfStart(0x5A, 0x5A) else { return nil }
+    bufferStart = start  // discard any garbage before the start marker
+    let available = buffer.count - bufferStart
+    guard available >= 6 else { return nil }
+    let total = Int(buffer[bufferStart + 4]) | (Int(buffer[bufferStart + 5]) << 8)
+    guard total >= 6, available >= total else { return nil }
+    let packet = Array(buffer[bufferStart..<(bufferStart + total)])
+    bufferStart += total
+    compactBuffer()
+    return packet
+  }
+
+  /// Index of the next `first second` start marker at or after `bufferStart`, or
+  /// nil if none is buffered yet.
+  private func indexOfStart(_ first: UInt8, _ second: UInt8) -> Int? {
+    guard buffer.count - bufferStart >= 2 else { return nil }
+    var index = bufferStart
+    while index < buffer.count - 1 {
+      if buffer[index] == first && buffer[index + 1] == second { return index }
+      index += 1
+    }
+    return nil
+  }
+
+  /// Reclaim the consumed prefix. Resets to empty once fully drained (the common
+  /// steady state); otherwise compacts only when the prefix grows large, so the
+  /// O(n) shift is amortized away rather than paid per packet.
+  private mutating func compactBuffer() {
+    if bufferStart == buffer.count {
+      buffer.removeAll(keepingCapacity: true)
+      bufferStart = 0
+    } else if bufferStart > 4096 {
+      buffer.removeFirst(bufferStart)
+      bufferStart = 0
+    }
+  }
 }
 
 /// TCP transport for the Midea LAN protocol. Version-3 devices use the "8370"
@@ -32,32 +89,24 @@ private enum ReadOutcome {
 /// `0x5A5A` framing directly, with no handshake.
 ///
 /// Not thread-safe: drive it from a single task, awaiting each call in turn.
-/// `@unchecked Sendable` because all receive-side mutable state (`buffer`,
-/// `terminalError`, `waiter`) is confined to the serial `queue`, and the
-/// send-side state (`packetId`, `localKey`) is only touched by that single
-/// driving task.
+/// `@unchecked Sendable` because the receive pump is the sole owner of its frame
+/// buffer and hands finished packets over through an `AsyncStream`, while the
+/// reader-side state (`events`, `terminalError`, `timeoutToken`, `packetId`,
+/// `localKey`, `pumpTask`) is only touched by that single driving task.
 public final class MideaConnection: @unchecked Sendable {
-  private let connection: NWConnection
+  private let connection: NetworkConnection<TCP>
   private let deviceId: UInt64
   private let version: Int
-  private let queue = DispatchQueue(label: "midea.connection")
 
-  private var buffer = [UInt8]()
-  // Index of the first unconsumed byte in `buffer`. Consuming a packet advances
-  // this instead of shifting the array; the prefix is reclaimed in bulk by
-  // `compactBuffer()`, keeping packet assembly O(1) amortized rather than O(n²).
-  private var bufferStart = 0
+  private let eventContinuation: AsyncStream<Event>.Continuation
+  private var events: AsyncStream<Event>.Iterator
+  private var terminalError: (any Error)?
+  private var timeoutToken: UInt64 = 0
+
   private var packetId: UInt16 = 0
   private var localKey: [UInt8]?
 
-  // Receive-pump state, touched only on `queue`. A single long-lived receive
-  // loop feeds `buffer`; a blocked reader parks its wake-up in `waiter` until
-  // the loop appends bytes or the stream ends. Keeping one receive in flight —
-  // and never abandoning it when a reader times out — means bytes are never
-  // lost mid-stream, so the framing stays in sync across timeouts.
-  private var pumpStarted = false
-  private var terminalError: Error?
-  private var waiter: (() -> Void)?
+  private var pumpTask: Task<Void, Never>?
 
   /// Create a connection to the device. No socket is opened until ``connect(timeout:)``.
   ///
@@ -70,17 +119,18 @@ public final class MideaConnection: @unchecked Sendable {
   public init(host: String, port: UInt16, deviceId: UInt64, version: Int) {
     self.deviceId = deviceId
     self.version = version
-    self.connection = NWConnection(
-      host: NWEndpoint.Host(host),
-      port: NWEndpoint.Port(rawValue: port)!,
-      using: .tcp
-    )
+    self.connection = NetworkConnection(
+      to: .hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
+    ) {
+      TCP()
+    }
+    let (stream, continuation) = AsyncStream.makeStream(of: Event.self)
+    self.events = stream.makeAsyncIterator()
+    self.eventContinuation = continuation
   }
 
   deinit {
-    // Break the pump's receive cycle if the connection is dropped without an
-    // explicit disconnect; otherwise the NWConnection would linger.
-    connection.cancel()
+    pumpTask?.cancel()
   }
 
   /// Open the TCP socket, returning once the connection is ready.
@@ -89,28 +139,53 @@ public final class MideaConnection: @unchecked Sendable {
   /// - Throws: ``TimeoutError`` if the timeout elapses, or a network error if
   ///   the connection fails.
   public func connect(timeout: TimeInterval = 6) async throws {
-    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-      let guardState = ResumeGuard()
-      queue.asyncAfter(deadline: .now() + timeout) {
-        if guardState.tryResume() { cont.resume(throwing: TimeoutError()) }
-      }
-      connection.stateUpdateHandler = { state in
-        switch state {
-        case .ready:
-          if guardState.tryResume() { cont.resume() }
-        case .failed(let error):
-          if guardState.tryResume() { cont.resume(throwing: error) }
-        default:
-          break
+    // A send never reports a failed connect and a receive only does so once the
+    // endpoint has answered, so the state handler is the only timely signal that
+    // the connect succeeded or failed. Installing it before reading `state`
+    // leaves no gap for a `.ready` that lands between the check and the wait.
+    let (states, stateContinuation) = AsyncStream.makeStream(
+      of: NetworkConnection<TCP>.State.self)
+    connection.onStateUpdate { _, state in
+      stateContinuation.yield(state)
+    }
+    defer { stateContinuation.finish() }
+
+    if connection.state == .ready {
+      return
+    } else if case .waiting(let error) = connection.state {
+      throw error
+    } else if case .failed(let error) = connection.state {
+      throw error
+    } else {
+      // Nothing dials out until an operation asks for bytes, so the pump's first
+      // receive is what actually opens the socket.
+      startPump()
+      try await withThrowingTaskGroup(of: Void.self) { group in
+        group.addTask {
+          for await state in states {
+            switch state {
+            case .ready: return
+            case .waiting(let error), .failed(let error): throw error
+            default: continue
+            }
+          }
+          throw CancellationError()
         }
+        group.addTask {
+          try await Task.sleep(for: .seconds(timeout))
+          throw TimeoutError()
+        }
+        // Cancelling these two is safe: neither is inside a send or a receive,
+        // which is what would tear the whole connection down.
+        defer { group.cancelAll() }
+        _ = try await group.next()
       }
-      connection.start(queue: queue)
     }
   }
 
   /// Close the socket.
   public func disconnect() {
-    connection.cancel()
+    pumpTask?.cancel()
   }
 
   /// Perform the V3 key handshake and derive the session key used to encrypt
@@ -150,14 +225,13 @@ public final class MideaConnection: @unchecked Sendable {
   ///   value lets a caller probe without blocking long.
   /// - Returns: The decoded application command frame.
   /// - Throws: ``TimeoutError`` if the timeout elapses, or an error if the
-  ///   stream ends or a frame can't be decoded.
+  ///   stream ends or a frame can't be decoded. Cancelling the calling task
+  ///   throws `CancellationError` and leaves the connection permanently
+  ///   unusable, so discard it — as callers already do on any error.
   public func readApplicationFrame(timeout: TimeInterval = 8) async throws -> [UInt8] {
+    let packet = try await readPacket(timeout: timeout)
     // V3 unwraps the 8370 layer around the 0x5A5A packet; V2 reads it bare.
-    let inner =
-      version >= 3
-      ? try process(try await readPacket(timeout: timeout))
-      : try await readV2Packet(timeout: timeout)
-    return try V2Packet.decode(inner)
+    return try V2Packet.decode(version >= 3 ? try process(packet) : packet)
   }
 
   private func nextPacketId() -> UInt16 {
@@ -232,165 +306,84 @@ public final class MideaConnection: @unchecked Sendable {
     }
   }
 
-  /// Assemble and return one complete 8370 packet from the receive buffer.
+  /// Wait for the pump to deliver the next complete packet. `timeout` bounds only
+  /// this wait: it arms a separate timer task that posts a token-tagged event,
+  /// never a cancellation of the pump — cancelling a task inside `receive` tears
+  /// the whole connection down. Every received byte therefore stays buffered
+  /// across a timeout, so the stream stays in sync and a later read resumes
+  /// cleanly, and a timer that fires just too late is ignored by every read but
+  /// the one that armed it.
   private func readPacket(timeout: TimeInterval = 8) async throws -> [UInt8] {
-    try await readFramed(timeout: timeout) { self.extractPacket() }
+    startPump()
+    if let terminalError { throw terminalError }
+
+    timeoutToken &+= 1
+    let token = timeoutToken
+    let timer = Task { [eventContinuation] in
+      do {
+        try await Task.sleep(for: .seconds(timeout))
+      } catch {
+        return
+      }
+      eventContinuation.yield(.timeout(token))
+    }
+    defer { timer.cancel() }
+
+    while let event = await events.next() {
+      switch event {
+      case .packet(let packet):
+        return packet
+      case .timeout(let fired) where fired == token:
+        throw TimeoutError()
+      case .timeout:
+        continue  // a stale timer armed by an earlier read
+      case .ended(let error):
+        terminalError = error
+        throw error
+      }
+    }
+    // `next()` only returns nil once this task has been cancelled, and that kills
+    // the stream for good, so nothing can be read from this connection again.
+    terminalError = CancellationError()
+    throw CancellationError()
   }
 
-  /// Assemble and return one complete bare 0x5A5A packet (V2 transport).
-  private func readV2Packet(timeout: TimeInterval = 8) async throws -> [UInt8] {
-    try await readFramed(timeout: timeout) { self.extractV2Packet() }
-  }
-
-  /// Wait for `extract` to yield one complete packet from the receive buffer,
-  /// pulling more bytes as they arrive. `timeout` bounds only the wait; on a
-  /// timeout every received byte stays buffered (the pump never abandons a
-  /// receive), so the stream stays in sync and a later read resumes cleanly.
-  private func readFramed(
-    timeout: TimeInterval, _ extract: @escaping @Sendable () -> [UInt8]?
-  ) async throws -> [UInt8] {
-    let deadline = DispatchTime.now() + timeout
-    while true {
-      let outcome: ReadOutcome = await withCheckedContinuation { cont in
-        let resumed = ResumeGuard()
-        queue.async {
-          self.startPump()
-          if let packet = extract() {
-            if resumed.tryResume() { cont.resume(returning: .packet(packet)) }
-          } else if let error = self.terminalError {
-            if resumed.tryResume() { cont.resume(returning: .failure(error)) }
-          } else {
-            // Park the wake-up and arm the timeout as a cancelable item, so a
-            // wake-up before the deadline cancels it instead of leaving a timer
-            // pending for every partial read.
-            let timeoutItem = DispatchWorkItem {
-              if resumed.tryResume() {
-                self.waiter = nil
-                cont.resume(returning: .timedOut)
-              }
-            }
-            self.waiter = {
-              timeoutItem.cancel()
-              if resumed.tryResume() { cont.resume(returning: .more) }
-            }
-            self.queue.asyncAfter(deadline: deadline, execute: timeoutItem)
+  /// Start the single long-lived receive loop that feeds the event stream.
+  /// Idempotent. Keeping one receive in flight — and never cancelling it when a
+  /// reader times out — means bytes are never lost mid-stream, so the framing
+  /// stays in sync across timeouts. Cancelling this task is also what closes the
+  /// socket, so only ``disconnect()`` and `deinit` may do it. It holds the
+  /// connection, not `self`, so a dropped ``MideaConnection`` can still deinit
+  /// while a receive is pending.
+  private func startPump() {
+    guard pumpTask == nil else { return }
+    pumpTask = Task { [connection, eventContinuation, version] in
+      var frames = FrameBuffer()
+      while true {
+        do {
+          let received = try await connection.receive(atLeast: 1, atMost: 65536)
+          frames.append(received.content)
+          while let packet = (version >= 3 ? frames.extractPacket() : frames.extractV2Packet()) {
+            eventContinuation.yield(.packet(packet))
           }
+          if received.metadata.endOfStream {
+            // A clean EOF is the peer closing the socket, not a malformed frame.
+            eventContinuation.yield(.ended(ProtocolError.connectionClosed))
+            return
+          }
+        } catch {
+          eventContinuation.yield(.ended(error))
+          return
         }
       }
-      switch outcome {
-      case .packet(let packet): return packet
-      case .failure(let error): throw error
-      case .timedOut: throw TimeoutError()
-      case .more: continue
-      }
-    }
-  }
-
-  /// Start the single long-lived receive loop that feeds `buffer`. Idempotent;
-  /// must be called on `queue`.
-  private func startPump() {
-    guard !pumpStarted else { return }
-    pumpStarted = true
-    receiveLoop()
-  }
-
-  /// One iteration of the receive pump. The completion runs on `queue`, appends
-  /// to `buffer`, wakes a waiting reader, and re-arms — so bytes are never lost
-  /// to an abandoned receive, even when a reader has already timed out.
-  private func receiveLoop() {
-    connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) {
-      [weak self] data, _, isComplete, error in
-      guard let self else { return }
-      if let data = data, !data.isEmpty {
-        self.buffer.append(contentsOf: data)
-        self.wakeWaiter()
-      }
-      if let error = error {
-        self.terminalError = error
-        self.wakeWaiter()
-      } else if isComplete {
-        // A clean EOF is the peer closing the socket, not a malformed frame.
-        self.terminalError = self.terminalError ?? ProtocolError.connectionClosed
-        self.wakeWaiter()
-      } else {
-        self.receiveLoop()
-      }
-    }
-  }
-
-  /// Wake the reader blocked in `readPacket`, if any. Must be called on `queue`.
-  private func wakeWaiter() {
-    guard let waiter = waiter else { return }
-    self.waiter = nil
-    waiter()
-  }
-
-  /// Pull one complete 8370 packet from `buffer`, or nil if a whole packet isn't
-  /// buffered yet. Advances `bufferStart` past consumed bytes. Must be called on
-  /// `queue`.
-  private func extractPacket() -> [UInt8]? {
-    guard let start = indexOfStart(0x83, 0x70) else { return nil }
-    bufferStart = start  // discard any garbage before the start marker
-    let available = buffer.count - bufferStart
-    guard available >= 6 else { return nil }
-    let total = (Int(buffer[bufferStart + 2]) << 8 | Int(buffer[bufferStart + 3])) + 8
-    guard available >= total else { return nil }
-    let packet = Array(buffer[bufferStart..<(bufferStart + total)])
-    bufferStart += total
-    compactBuffer()
-    return packet
-  }
-
-  /// Pull one complete bare 0x5A5A packet from `buffer`, or nil if a whole packet
-  /// isn't buffered yet. Its total length lives at bytes 4-5, little-endian.
-  /// Advances `bufferStart` past consumed bytes. Must be called on `queue`.
-  private func extractV2Packet() -> [UInt8]? {
-    guard let start = indexOfStart(0x5A, 0x5A) else { return nil }
-    bufferStart = start  // discard any garbage before the start marker
-    let available = buffer.count - bufferStart
-    guard available >= 6 else { return nil }
-    let total = Int(buffer[bufferStart + 4]) | (Int(buffer[bufferStart + 5]) << 8)
-    guard total >= 6, available >= total else { return nil }
-    let packet = Array(buffer[bufferStart..<(bufferStart + total)])
-    bufferStart += total
-    compactBuffer()
-    return packet
-  }
-
-  /// Index of the next `first second` start marker at or after `bufferStart`, or
-  /// nil if none is buffered yet. Must be called on `queue`.
-  private func indexOfStart(_ first: UInt8, _ second: UInt8) -> Int? {
-    guard buffer.count - bufferStart >= 2 else { return nil }
-    var index = bufferStart
-    while index < buffer.count - 1 {
-      if buffer[index] == first && buffer[index + 1] == second { return index }
-      index += 1
-    }
-    return nil
-  }
-
-  /// Reclaim the consumed prefix. Resets to empty once fully drained (the common
-  /// steady state); otherwise compacts only when the prefix grows large, so the
-  /// O(n) shift is amortized away rather than paid per packet. Must be called on
-  /// `queue`.
-  private func compactBuffer() {
-    if bufferStart == buffer.count {
-      buffer.removeAll(keepingCapacity: true)
-      bufferStart = 0
-    } else if bufferStart > 4096 {
-      buffer.removeFirst(bufferStart)
-      bufferStart = 0
     }
   }
 
   private func writeRaw(_ data: [UInt8]) async throws {
-    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-      connection.send(
-        content: Data(data),
-        completion: .contentProcessed { error in
-          if let error = error { cont.resume(throwing: error) } else { cont.resume() }
-        })
-    }
+    // A caller that skips connect() still needs the pump, both to open the socket
+    // and to notice the peer closing it.
+    startPump()
+    try await connection.send(Data(data))
   }
 
   private func be16(_ value: UInt16) -> [UInt8] {
