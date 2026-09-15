@@ -1,18 +1,22 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 let package = Package(
   name: "MideaKit",
-  platforms: [.macOS(.v13), .iOS(.v16)],
+  platforms: [.macOS(.v26), .iOS(.v26)],
   products: [
     .library(name: "MideaKit", targets: ["MideaKit"])
   ],
   targets: [
-    .target(name: "MideaKit"),
+    .target(
+      name: "MideaKit",
+      swiftSettings: [.enableUpcomingFeature("NonisolatedNonsendingByDefault")]
+    ),
     .testTarget(
       name: "MideaKitTests",
       dependencies: ["MideaKit"],
-      resources: [.copy("vectors.json")]
+      resources: [.copy("vectors.json")],
+      swiftSettings: [.enableUpcomingFeature("NonisolatedNonsendingByDefault")]
     ),
   ]
 )
