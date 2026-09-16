@@ -115,13 +115,15 @@ Version-2 devices have no handshake, so they skip the warm-up entirely.
 
 ### Concurrency
 
-`MideaClient` owns one stateful connection, so interleaving calls on a single
-client would corrupt the stream. It does not serialize internally — drive one
-client from a single task at a time, awaiting each call before the next. A
-connection dropped while idle is re-established automatically, and only
-transport-level errors are retried (protocol, auth, and timeout errors surface
-immediately). The cloud client, by contrast, is stateless after `login()` and
-fully `Sendable`, so `Setup` provisions all discovered devices concurrently.
+`MideaClient` is an actor, so it is safe to hold anywhere — a `@MainActor` view
+model included — and its work runs on its own executor rather than the caller's.
+It still owns one stateful connection, and actor reentrancy lets overlapping
+calls interleave on it and corrupt the stream, so drive one client from a single
+task at a time, awaiting each call before the next. A connection dropped while
+idle is re-established automatically, and only transport-level errors are
+retried (protocol, auth, and timeout errors surface immediately). The cloud
+client, by contrast, is stateless after `login()` and fully `Sendable`, so
+`Setup` provisions all discovered devices concurrently.
 
 ### Token endianness
 
