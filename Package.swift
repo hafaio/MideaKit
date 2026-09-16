@@ -8,15 +8,11 @@ let package = Package(
     .library(name: "MideaKit", targets: ["MideaKit"])
   ],
   targets: [
-    .target(
-      name: "MideaKit",
-      swiftSettings: [.enableUpcomingFeature("NonisolatedNonsendingByDefault")]
-    ),
+    .target(name: "MideaKit"),
     .testTarget(
       name: "MideaKitTests",
       dependencies: ["MideaKit"],
-      resources: [.copy("vectors.json")],
-      swiftSettings: [.enableUpcomingFeature("NonisolatedNonsendingByDefault")]
+      resources: [.copy("vectors.json")]
     ),
   ]
 )

@@ -6,8 +6,13 @@ import Network
 /// Holds a persistent authenticated connection and reuses it across calls, so
 /// repeated ``refresh()`` polls are cheap (a single query/response, no
 /// handshake). The connection is re-established lazily when absent, expired, or
-/// after a failed call. Drive it from one task at a time — the connection is not
-/// re-entrant, so callers must serialize their own access.
+/// after a failed call.
+///
+/// Being an actor, it can be held from any context — the main actor included —
+/// and its work runs on its own executor rather than the caller's. Actors are
+/// reentrant, though, so overlapping calls on one client still interleave on its
+/// single connection and corrupt the stream: drive each client from one task at a
+/// time, awaiting each call before the next.
 ///
 /// Version-3 devices use a token/key handshake; version-2 devices use an
 /// unauthenticated `0x5A5A` transport with no handshake. The client selects the
@@ -36,7 +41,7 @@ import Network
 ///   set.mode = OperationalMode.cool.rawValue
 /// }
 /// ```
-public final class MideaClient {
+public actor MideaClient {
   private let host: String
   private let port: UInt16
   private let deviceId: UInt64
@@ -84,7 +89,7 @@ public final class MideaClient {
 
   /// Run `body` with a client built from `credentials`, disconnecting when it
   /// returns or throws — the scoped equivalent of pairing a client with a
-  /// `defer { client.disconnect() }`.
+  /// trailing `await client.disconnect()`.
   ///
   /// ```swift
   /// let state = try await MideaClient.withSession(credentials: creds) { client in
@@ -92,17 +97,26 @@ public final class MideaClient {
   /// }
   /// ```
   ///
+  /// `body` runs on the caller's actor, so it can reach the caller's own state
+  /// directly; the client's work still happens on the client's executor.
+  ///
   /// - Parameters:
   ///   - credentials: The stored credentials for the device.
   ///   - body: A closure run with the client; it connects lazily on first use.
   /// - Returns: Whatever `body` returns.
-  public static func withSession<T>(
+  public static nonisolated(nonsending) func withSession<T>(
     credentials: DeviceCredentials,
     _ body: (MideaClient) async throws -> T
   ) async rethrows -> T {
     let client = MideaClient(credentials: credentials)
-    defer { client.disconnect() }
-    return try await body(client)
+    do {
+      let result = try await body(client)
+      await client.disconnect()
+      return result
+    } catch {
+      await client.disconnect()
+      throw error
+    }
   }
 
   /// Eagerly establish the connection (optional; calls connect lazily anyway).
@@ -171,7 +185,7 @@ public final class MideaClient {
   ///   device's current state.
   /// - Returns: The device's state after applying the change.
   /// - Throws: An error if the device can't be reached or the exchange fails.
-  public func apply(_ change: @escaping (inout SetState) -> Void) async throws -> ACState {
+  public func apply(_ change: sending (inout SetState) -> Void) async throws -> ACState {
     try await withConnection { connection in
       try await connection.sendApplicationFrame(Command.getState())
       let current = try await self.readState(connection)

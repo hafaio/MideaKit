@@ -27,8 +27,10 @@ _ = try await client.apply { set in
 }
 ```
 
-Calls are `async`; drive one ``MideaClient`` from a single task at a time, as the
-connection is not re-entrant.
+Calls are `async`. ``MideaClient`` is an actor, so it can be held from any
+context and its work runs off the caller's actor, but actors are reentrant:
+drive one client from a single task at a time, awaiting each call before the
+next, or overlapping calls will interleave on its one connection.
 
 ## Topics
 

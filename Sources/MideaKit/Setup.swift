@@ -94,12 +94,12 @@ public enum Setup {
       version: device.version, token: [], key: [])
     do {
       _ = try await client.refresh()
-      client.disconnect()
+      await client.disconnect()
       return DeviceCredentials(
         name: device.name, id: device.id, ip: device.ip, port: device.port,
         version: device.version, token: "", key: "", serialNumber: device.serialNumber)
     } catch {
-      client.disconnect()
+      await client.disconnect()
       return nil
     }
   }
@@ -120,13 +120,13 @@ public enum Setup {
         key: DeviceCredentials.hexToBytes(pair.key))
       do {
         _ = try await client.refresh()
-        client.disconnect()
+        await client.disconnect()
         return DeviceCredentials(
           name: device.name, id: device.id, ip: device.ip, port: device.port,
           version: device.version, token: pair.token, key: pair.key,
           serialNumber: device.serialNumber)
       } catch {
-        client.disconnect()
+        await client.disconnect()
         continue
       }
     }
