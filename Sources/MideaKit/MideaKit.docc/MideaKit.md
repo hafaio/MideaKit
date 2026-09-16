@@ -28,9 +28,9 @@ _ = try await client.apply { set in
 ```
 
 Calls are `async`. ``MideaClient`` is an actor, so it can be held from any
-context and its work runs off the caller's actor, but actors are reentrant:
-drive one client from a single task at a time, awaiting each call before the
-next, or overlapping calls will interleave on its one connection.
+context and its work runs off the caller's actor. Calls on one client are
+serialized in the order they're made, so overlapping calls are safe: each waits
+its turn on the one connection, and starts its own timeout only when it runs.
 
 ## Topics
 

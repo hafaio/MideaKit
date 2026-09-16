@@ -10,8 +10,8 @@ This is a Swift port of [msmart-ng](https://github.com/mill1000/midea-msmart).
 Works on macOS 26 and iOS 26 or later. Pure Swift (Network, CryptoKit,
 CommonCrypto) with no third-party dependencies.
 
-Calls are `async` — drive one client from a single task at a time (await each
-call before the next); the connection is not re-entrant.
+Calls are `async`, and calls on one client are serialized in the order they're
+made, so overlapping calls from different tasks are safe.
 
 ## Features
 
@@ -117,12 +117,13 @@ Version-2 devices have no handshake, so they skip the warm-up entirely.
 
 `MideaClient` is an actor, so it is safe to hold anywhere — a `@MainActor` view
 model included — and its work runs on its own executor rather than the caller's.
-It still owns one stateful connection, and actor reentrancy lets overlapping
-calls interleave on it and corrupt the stream, so drive one client from a single
-task at a time, awaiting each call before the next. A connection dropped while
-idle is re-established automatically, and only transport-level errors are
-retried (protocol, auth, and timeout errors surface immediately). The cloud
-client, by contrast, is stateless after `login()` and fully `Sendable`, so
+It still owns one stateful connection, so calls on a client are serialized in
+the order they're made: overlapping calls from a polling timer, a UI action, and
+anywhere else are safe, and a call queued behind a slow one waits its turn, its
+own timeout starting only when it runs. A connection dropped while idle is
+re-established automatically, and only transport-level errors are retried
+(protocol, auth, and timeout errors surface immediately). The cloud client, by
+contrast, is stateless after `login()` and fully `Sendable`, so
 `Setup` provisions all discovered devices concurrently.
 
 ### Token endianness
