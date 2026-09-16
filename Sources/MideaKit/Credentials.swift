@@ -110,7 +110,7 @@ extension MideaClient {
   /// Create a client from stored ``DeviceCredentials``.
   ///
   /// - Parameter credentials: The stored credentials for one device.
-  public convenience init(credentials: DeviceCredentials) {
+  public init(credentials: DeviceCredentials) {
     self.init(
       host: credentials.ip, port: credentials.port, deviceId: credentials.id,
       version: credentials.version, token: credentials.tokenBytes, key: credentials.keyBytes
