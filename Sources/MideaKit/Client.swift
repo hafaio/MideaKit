@@ -9,10 +9,11 @@ import Network
 /// after a failed call.
 ///
 /// Being an actor, it can be held from any context — the main actor included —
-/// and its work runs on its own executor rather than the caller's. Actors are
-/// reentrant, though, so overlapping calls on one client still interleave on its
-/// single connection and corrupt the stream: drive each client from one task at a
-/// time, awaiting each call before the next.
+/// and its work runs on its own executor rather than the caller's. Calls on one
+/// client are serialized in the order they're made, so overlapping calls from a
+/// polling timer, a UI action, and anywhere else are safe: each waits for the
+/// one before it to finish on the single connection, and a call queued behind a
+/// slow one only starts its own timeout once its turn comes.
 ///
 /// Version-3 devices use a token/key handshake; version-2 devices use an
 /// unauthenticated `0x5A5A` transport with no handshake. The client selects the
@@ -51,6 +52,10 @@ public actor MideaClient {
 
   private var connection: MideaConnection?
   private var authenticatedAt: Date?
+
+  // Each arriving call waits on this before it runs, so calls take the connection in turn.
+  private var queueTail: Task<Void, Never>?
+
   // Re-authenticate before the device's ~12h session key expires.
   private let sessionLifetime: TimeInterval = 11 * 3600
 
@@ -121,15 +126,24 @@ public actor MideaClient {
 
   /// Eagerly establish the connection (optional; calls connect lazily anyway).
   public func connect() async throws {
-    try await ensureConnected()
+    try await serialized {
+      try await ensureConnected()
+    }
   }
 
   /// Close the live connection and drop the cached session, if any. The next
-  /// call reconnects lazily.
-  public func disconnect() {
-    connection?.disconnect()
-    connection = nil
-    authenticatedAt = nil
+  /// call reconnects lazily. Like every call it waits its turn, so a disconnect
+  /// issued during a refresh closes the socket once that refresh is done rather
+  /// than mid-frame.
+  public func disconnect() async {
+    do {
+      try await serialized {
+        dropConnection()
+      }
+    } catch {
+      // Cancelled before its turn came; still close the socket the caller asked to close.
+      dropConnection()
+    }
   }
 
   /// Query and return the device's current state.
@@ -137,9 +151,11 @@ public actor MideaClient {
   /// - Returns: The device's current state.
   /// - Throws: An error if the device can't be reached or the exchange fails.
   public func refresh() async throws -> ACState {
-    try await withConnection { connection in
-      try await connection.sendApplicationFrame(Command.getState())
-      return try await self.readState(connection)
+    try await serialized {
+      try await withConnection { connection in
+        try await connection.sendApplicationFrame(Command.getState())
+        return try await self.readState(connection)
+      }
     }
   }
 
@@ -150,9 +166,11 @@ public actor MideaClient {
   /// - Returns: The device's state after applying the change.
   /// - Throws: An error if the device can't be reached or the exchange fails.
   public func apply(_ set: SetState) async throws -> ACState {
-    try await withConnection { connection in
-      try await connection.sendApplicationFrame(set.encode())
-      return try await self.readState(connection)
+    try await serialized {
+      try await withConnection { connection in
+        try await connection.sendApplicationFrame(set.encode())
+        return try await self.readState(connection)
+      }
     }
   }
 
@@ -162,10 +180,12 @@ public actor MideaClient {
   /// - Returns: The device's state after toggling the display.
   /// - Throws: An error if the device can't be reached or the exchange fails.
   public func toggleDisplay(beep: Bool = true) async throws -> ACState {
-    // Relative command: don't retry, or a lost response double-toggles.
-    try await withConnection(retry: false) { connection in
-      try await connection.sendApplicationFrame(Command.toggleDisplay(beep: beep))
-      return try await self.readState(connection)
+    try await serialized {
+      // Relative command: don't retry, or a lost response double-toggles.
+      try await withConnection(retry: false) { connection in
+        try await connection.sendApplicationFrame(Command.toggleDisplay(beep: beep))
+        return try await self.readState(connection)
+      }
     }
   }
 
@@ -186,14 +206,40 @@ public actor MideaClient {
   /// - Returns: The device's state after applying the change.
   /// - Throws: An error if the device can't be reached or the exchange fails.
   public func apply(_ change: sending (inout SetState) -> Void) async throws -> ACState {
-    try await withConnection { connection in
-      try await connection.sendApplicationFrame(Command.getState())
-      let current = try await self.readState(connection)
-      var set = SetState(from: current)
-      change(&set)
-      try await connection.sendApplicationFrame(set.encode())
-      return try await self.readState(connection)
+    try await serialized {
+      try await withConnection { connection in
+        try await connection.sendApplicationFrame(Command.getState())
+        let current = try await self.readState(connection)
+        var set = SetState(from: current)
+        change(&set)
+        try await connection.sendApplicationFrame(set.encode())
+        return try await self.readState(connection)
+      }
     }
+  }
+
+  /// Run `operation` once every call made before it has finished. A call whose
+  /// task is cancelled while it waits its turn throws `CancellationError`
+  /// without ever touching the device; the calls behind it carry on.
+  ///
+  /// Only public entry points go through here — a queued operation calling
+  /// another one would wait on itself.
+  private func serialized<T>(_ operation: () async throws -> T) async throws -> T {
+    let predecessor = queueTail
+    // The place in line has to be taken before the first suspension, to preserve arrival order.
+    let (turn, release) = AsyncStream<Void>.makeStream()
+    queueTail = Task { for await _ in turn {} }
+    defer { release.finish() }
+
+    await predecessor?.value
+    try Task.checkCancellation()
+    return try await operation()
+  }
+
+  private func dropConnection() {
+    connection?.disconnect()
+    connection = nil
+    authenticatedAt = nil
   }
 
   private func ensureConnected() async throws {
@@ -202,7 +248,7 @@ public actor MideaClient {
     {
       return
     }
-    disconnect()
+    dropConnection()
     let connection = MideaConnection(host: host, port: port, deviceId: deviceId, version: version)
     do {
       try await connection.connect()
@@ -253,7 +299,7 @@ public actor MideaClient {
     } catch {
       // Any failure may have left the stream mid-frame, so drop the connection;
       // the next call reconnects cleanly. Retry once for transport faults only.
-      disconnect()
+      dropConnection()
       guard retry, Self.isRetryable(error) else { throw error }
       try? await Task.sleep(for: reconnectCooldown)
       try await ensureConnected()
@@ -261,7 +307,7 @@ public actor MideaClient {
       do {
         return try await operation(fresh)
       } catch {
-        disconnect()
+        dropConnection()
         throw error
       }
     }
