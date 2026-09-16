@@ -133,11 +133,14 @@ public final class MideaConnection: @unchecked Sendable {
     pumpTask?.cancel()
   }
 
-  /// Open the TCP socket, returning once the connection is ready.
+  /// Open the TCP socket, returning once the connection is ready. A refused or
+  /// unreachable endpoint only puts the connection in a waiting state, which the
+  /// network stack retries on its own, so the connect keeps waiting for it to
+  /// come up until the timeout runs out.
   ///
   /// - Parameter timeout: How long, in seconds, to wait for the connection.
   /// - Throws: ``TimeoutError`` if the timeout elapses, or a network error if
-  ///   the connection fails.
+  ///   the connection fails outright.
   public func connect(timeout: TimeInterval = 6) async throws {
     // A send never reports a failed connect and a receive only does so once the
     // endpoint has answered, so the state handler is the only timely signal that
@@ -152,8 +155,6 @@ public final class MideaConnection: @unchecked Sendable {
 
     if connection.state == .ready {
       return
-    } else if case .waiting(let error) = connection.state {
-      throw error
     } else if case .failed(let error) = connection.state {
       throw error
     } else {
@@ -165,7 +166,8 @@ public final class MideaConnection: @unchecked Sendable {
           for await state in states {
             switch state {
             case .ready: return
-            case .waiting(let error), .failed(let error): throw error
+            case .failed(let error): throw error
+            // Waiting is the stack still retrying, not a verdict; only the timeout gives up.
             default: continue
             }
           }

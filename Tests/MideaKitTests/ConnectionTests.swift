@@ -144,9 +144,9 @@ private enum FakeDeviceError: Error {
     }
   }
 
-  /// A refused connection surfaces the network error immediately rather than
-  /// sitting until the timeout; the client's retry logic keys off that error.
-  @Test(.timeLimit(.minutes(1))) func refusedConnectionFailsFast() async throws {
+  /// A refused connection keeps retrying rather than failing, so it runs out its
+  /// whole timeout and reports that timeout instead of the refusal.
+  @Test(.timeLimit(.minutes(1))) func refusedConnectionWaitsForTimeout() async throws {
     let device = try await FakeDevice.start { _ in }
     let port = device.port
     device.stop()
@@ -156,14 +156,10 @@ private enum FakeDeviceError: Error {
     defer { connection.disconnect() }
 
     let start = ContinuousClock.now
-    do {
-      try await connection.connect(timeout: 5)
-      Issue.record("connecting to a closed port should fail")
-    } catch {
-      #expect(error is NWError, "expected a network error, got \(error)")
-      #expect(!(error is TimeoutError))
+    await #expect(throws: TimeoutError.self) {
+      try await connection.connect(timeout: 1)
     }
-    #expect(start.duration(to: .now) < .seconds(3))
+    #expect(start.duration(to: .now) > .milliseconds(900))
   }
 
   /// Disconnecting closes the socket, which the device sees as an end of stream.
